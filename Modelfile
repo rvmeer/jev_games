@@ -1,0 +1,4 @@
+FROM ./Jev-Style-Qwen3.5-2B-Decision-Q8_0.gguf
+TEMPLATE """{{ .Prompt }}"""
+PARAMETER temperature 0
+PARAMETER num_ctx 2048
