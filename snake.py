@@ -1,24 +1,22 @@
-"""Snake bestuurd door een lokaal Jev-style beslismodel (via Ollama).
+"""Snake, pong en tetris bestuurd door een lokaal Jev-style beslismodel (MLX, CUDA of Ollama).
 
 Het model krijgt de spelsituatie (state) + een vraag + opties en geeft per
 optie een kans terug. De snake draait links/rechts t.o.v. zijn kop
-(of gaat rechtdoor).
+(of gaat rechtdoor). Met Tab wissel je tussen de spellen.
 
-Start: python snake.py   (opties: --model, --speed, --no-straight)
+Start: python snake.py   (zie --help voor opties)
 """
 
 import argparse
 import math
 import random
-import sys
 from collections import deque
-import http.client
-import urllib.request
-import json
 
 import pygame
 
-DEFAULT_MODEL = "jev-style-2b"
+from jev import BACKENDS, DEFAULT_MODEL, load_backend, softmax
+from pong import PongMode
+from tetris import TetrisMode
 
 GRID_W, GRID_H = 20, 20
 CELL = 28
@@ -195,129 +193,113 @@ def move_rank(fact):
 
 
 class JevBrain:
-    """Vraagt het Jev-style beslismodel om een keuze (Choice-primitive)."""
+    """Vraagt het Jev-style beslismodel om een snake-zet (Choice-primitive)."""
 
     LABELS = {"left": "turn left", "straight": "go straight", "right": "turn right"}
 
-    def __init__(self, model, moves, straight_bonus=0.0, prefer_hint=True):
-        self.model = model
+    def __init__(self, backend, moves, straight_bonus=0.0, prefer_hint=True):
+        self.client = backend.client()
         self.moves = moves
         self.straight_bonus = straight_bonus  # extra logit voor 'straight' (beleid in code)
         self.prefer_hint = prefer_hint and "straight" in moves
         self.last_probs = {}
-        self.conn = None
 
-    def _post(self, body):
-        for attempt in (0, 1):
-            try:
-                if self.conn is None:
-                    self.conn = http.client.HTTPConnection("localhost", 11434, timeout=30)
-                self.conn.request("POST", "/api/generate", body,
-                                  {"Content-Type": "application/json"})
-                return json.loads(self.conn.getresponse().read())
-            except (http.client.HTTPException, OSError):
-                self.conn.close()
-                self.conn = None
-                if attempt:
-                    raise
+    def question(self):
+        hint = " If moves are equally good, prefer going straight." if self.prefer_hint else ""
+        return ("Which move avoids crashes and traps and gets the candy safely "
+                f"in the fewest steps?{hint}")
 
     def prompt(self, state):
-        opts = "\n".join(f"{chr(65 + i)}. {self.LABELS[m]}" for i, m in enumerate(self.moves))
-        hint = (" If moves are equally good, prefer going straight." if self.prefer_hint else "")
-        return ("You are a decision function. Read the state, then answer the question "
-                "by choosing exactly one option.\n\n"
-                f"[State]\n{state}\n\n"
-                "[Question]\nWhich move avoids crashes and traps and gets the candy safely "
-                f"in the fewest steps?{hint}\n\n"
-                f"[Options]\n{opts}\n\nAnswer:")
+        return self.client.prompt(state, self.question(), [self.LABELS[m] for m in self.moves])
 
     def decide(self, game):
         facts = game.move_facts(self.moves)
-        body = json.dumps({
-            "model": self.model, "raw": True, "stream": False,
-            "prompt": self.prompt(game.describe(self.moves, facts)),
-            "options": {"num_predict": 1, "temperature": 0},
-            "logprobs": True, "top_logprobs": 20,
-            "keep_alive": "10m",
-        }).encode()
-        data = self._post(body)
-        letters = {chr(65 + i): m for i, m in enumerate(self.moves)}
-        scores = {m: -math.inf for m in self.moves}
-        for t in data["logprobs"][0]["top_logprobs"]:
-            letter = t["token"].strip()
-            if letter in letters:
-                scores[letters[letter]] = max(scores[letters[letter]], t["logprob"])
+        scores = dict(zip(self.moves, self.client.logprobs(
+            game.describe(self.moves, facts), self.question(),
+            [self.LABELS[m] for m in self.moves])))
         # Voorkeur voor rechtdoor alleen als dat volgens de feiten even goed is als de beste zet.
         if ("straight" in scores and scores["straight"] > -math.inf
                 and move_rank(facts["straight"]) == max(move_rank(f) for f in facts.values())):
             scores["straight"] += self.straight_bonus
-        mx = max(scores.values())
-        if mx == -math.inf:
-            self.last_probs = {m: 1 / len(self.moves) for m in self.moves}
-        else:
-            exp = {m: math.exp(s - mx) for m, s in scores.items()}
-            tot = sum(exp.values())
-            self.last_probs = {m: v / tot for m, v in exp.items()}
+        self.last_probs = dict(zip(self.moves, softmax(list(scores.values()))))
         return max(self.last_probs, key=self.last_probs.get)
 
 
-def check_ollama(model):
-    try:
-        with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=5) as r:
-            names = [m["name"] for m in json.loads(r.read())["models"]]
-    except Exception as e:
-        sys.exit(f"Ollama niet bereikbaar op localhost:11434 ({e}). Start 'ollama serve'.")
-    if not any(n.split(":")[0] == model.split(":")[0] for n in names):
-        sys.exit(f"Model '{model}' niet gevonden in Ollama. Zie README.md voor installatie.")
+class SnakeMode:
+    """Snake als modus in de gedeelde pygame-loop."""
 
+    title = "Snake"
 
-def draw(screen, font, small, game, brain, model, speed, actual):
-    screen.fill((18, 18, 24))
-    for x in range(game.w):
-        for y in range(game.h):
-            pygame.draw.rect(screen, (28, 28, 36), (x * CELL, y * CELL, CELL - 1, CELL - 1))
-    if game.candy:
-        cx, cy = game.candy
-        pygame.draw.circle(screen, (240, 70, 120),
-                           (cx * CELL + CELL // 2, cy * CELL + CELL // 2), CELL // 2 - 4)
-    for i, (x, y) in enumerate(game.snake):
-        col = (120, 230, 120) if i == 0 else (60, 170, 80)
-        pygame.draw.rect(screen, col, (x * CELL + 1, y * CELL + 1, CELL - 3, CELL - 3),
-                         border_radius=6)
-    top = game.h * CELL
-    pygame.draw.rect(screen, (10, 10, 14), (0, top, game.w * CELL, PANEL_H))
-    screen.blit(font.render(f"Score: {game.score}   Lengte: {len(game.snake)}", True,
-                            (230, 230, 230)), (10, top + 8))
-    probs = "  ".join(f"{m}: {p:.0%}" for m, p in brain.last_probs.items())
-    limit = "max" if speed <= 0 else f"{speed:g}"
-    screen.blit(small.render(f"Model: {model}   {actual:.1f} stappen/s (limiet {limit}, +/-)",
-                             True, (150, 150, 170)), (10, top + 38))
-    screen.blit(small.render(probs, True, (150, 200, 255)), (10, top + 58))
-    if not game.alive:
-        msg = font.render("GAME OVER - spatie = opnieuw, esc = stop", True, (255, 90, 90))
-        screen.blit(msg, msg.get_rect(center=(game.w * CELL // 2, top // 2)))
-    pygame.display.flip()
+    def __init__(self, backend, moves, straight_bonus):
+        self.game = Game()
+        self.brain = JevBrain(backend, moves, straight_bonus=straight_bonus)
+
+    def active(self):
+        return self.game.alive
+
+    def update(self):
+        self.game.step(self.brain.decide(self.game))
+
+    def on_space(self):
+        if not self.game.alive:
+            self.game.reset()
+
+    def on_key(self, key):
+        return False
+
+    def draw(self, screen, font, small, status, panel_top):
+        game = self.game
+        for x in range(game.w):
+            for y in range(game.h):
+                pygame.draw.rect(screen, (28, 28, 36), (x * CELL, y * CELL, CELL - 1, CELL - 1))
+        if game.candy:
+            cx, cy = game.candy
+            pygame.draw.circle(screen, (240, 70, 120),
+                               (cx * CELL + CELL // 2, cy * CELL + CELL // 2), CELL // 2 - 4)
+        for i, (x, y) in enumerate(game.snake):
+            col = (120, 230, 120) if i == 0 else (60, 170, 80)
+            pygame.draw.rect(screen, col, (x * CELL + 1, y * CELL + 1, CELL - 3, CELL - 3),
+                             border_radius=6)
+        screen.blit(font.render(f"Score: {game.score}   Lengte: {len(game.snake)}", True,
+                                (230, 230, 230)), (10, panel_top + 8))
+        screen.blit(small.render(status, True, (150, 150, 170)), (10, panel_top + 38))
+        probs = "  ".join(f"{m}: {p:.0%}" for m, p in self.brain.last_probs.items())
+        screen.blit(small.render(probs, True, (150, 200, 255)), (10, panel_top + 58))
+        if not game.alive:
+            msg = font.render("GAME OVER - spatie = opnieuw", True, (255, 90, 90))
+            screen.blit(msg, msg.get_rect(center=(game.w * CELL // 2, panel_top // 2)))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Snake bestuurd door een lokaal Jev-style model")
-    ap.add_argument("--model", default=DEFAULT_MODEL)
-    ap.add_argument("--speed", type=float, default=15,
+    ap = argparse.ArgumentParser(description="Snake, pong en tetris bestuurd door een lokaal "
+                                             "Jev-style model (Tab = wisselen)")
+    ap.add_argument("--backend", choices=BACKENDS, default="auto",
+                    help="waar het model draait (auto = mlx op Apple Silicon, anders cuda, "
+                         "anders ollama)")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="Ollama-modelnaam (alleen bij ollama)")
+    ap.add_argument("--speed", type=float, default=0,
                     help="max stappen per seconde, 0 = zo snel als het model kan")
     ap.add_argument("--straight-bonus", type=float, default=3.0,
-                    help="voorkeur voor rechtdoor bij gelijkwaardige zetten (extra logit)")
+                    help="snake: voorkeur voor rechtdoor bij gelijkwaardige zetten (extra logit)")
+    ap.add_argument("--stay-bonus", type=float, default=3.0,
+                    help="pong: voorkeur voor stilstaan bij gelijkwaardige zetten (extra logit)")
     ap.add_argument("--no-straight", action="store_true",
-                    help="alleen links/rechts, nooit rechtdoor")
+                    help="snake: alleen links/rechts, nooit rechtdoor")
+    ap.add_argument("--pong", action="store_true", help="start in pong")
+    ap.add_argument("--tetris", action="store_true", help="start in tetris")
+    ap.add_argument("--human", action="store_true",
+                    help="start in pong en speel zelf het linkerbatje (H = wisselen)")
     args = ap.parse_args()
 
-    check_ollama(args.model)
+    backend = load_backend(args.backend, args.model)
     moves = ["left", "right"] if args.no_straight else ["left", "straight", "right"]
-    brain = JevBrain(args.model, moves, straight_bonus=args.straight_bonus)
-    game = Game()
+    modes = [SnakeMode(backend, moves, args.straight_bonus),
+             PongMode(backend, GRID_W, GRID_H, CELL, args.stay_bonus, human=args.human),
+             TetrisMode(backend, GRID_W, GRID_H, CELL)]
+    current = 2 if args.tetris else 1 if args.pong or args.human else 0
 
     pygame.init()
     screen = pygame.display.set_mode((GRID_W * CELL, GRID_H * CELL + PANEL_H))
-    pygame.display.set_caption("Snake - Jev-style beslismodel")
     font = pygame.font.SysFont("menlo", 20, bold=True)
     small = pygame.font.SysFont("menlo", 15)
     clock = pygame.time.Clock()
@@ -325,23 +307,37 @@ def main():
     steps = [0.0] * 10  # tijdstempels van de laatste stappen
 
     while True:
+        mode = modes[current]
+        pygame.display.set_caption(f"{mode.title} - Jev-style beslismodel via {backend.name} "
+                                   "(Tab = wisselen)")
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE):
                 pygame.quit()
                 return
             if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_SPACE and not game.alive:
-                    game.reset()
+                if mode.on_key(ev.key):
+                    pass
+                elif ev.key == pygame.K_TAB:
+                    current = (current + 1) % len(modes)
+                    mode = modes[current]
+                    steps = [0.0] * 10
+                elif ev.key == pygame.K_SPACE:
+                    mode.on_space()
                 elif ev.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS, pygame.K_UP):
                     speed = 0 if speed <= 0 or speed >= 40 else speed + 5
                 elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS, pygame.K_DOWN):
                     speed = 40 if speed <= 0 else max(1, speed - 5)
-        if game.alive:
-            game.step(brain.decide(game))
+        if mode.active():
+            mode.update()
             steps = steps[1:] + [pygame.time.get_ticks() / 1000]
         span = steps[-1] - steps[0]
-        actual = (len(steps) - 1) / span if game.alive and steps[0] and span > 0 else 0
-        draw(screen, font, small, game, brain, args.model, speed, actual)
+        actual = (len(steps) - 1) / span if mode.active() and steps[0] and span > 0 else 0
+        limit = "max" if speed <= 0 else f"{speed:g}"
+        status = f"{actual:.1f} stappen/s (limiet {limit}, +/-)   Tab = wisselen"
+        screen.fill((18, 18, 24))
+        pygame.draw.rect(screen, (10, 10, 14), (0, GRID_H * CELL, GRID_W * CELL, PANEL_H))
+        mode.draw(screen, font, small, status, GRID_H * CELL)
+        pygame.display.flip()
         clock.tick(speed if speed > 0 else 0)
 
 

@@ -1,0 +1,9 @@
+# NVIDIA-GPU: het model draait in Python via PyTorch + CUDA (geen Ollama nodig).
+# Installeer eerst PyTorch met CUDA, zie https://pytorch.org/get-started/locally/
+-r requirements.txt
+torch>=2.6
+transformers>=5.18
+huggingface_hub
+safetensors
+# Optioneel, veel sneller voor de Gated-DeltaNet-lagen:
+flash-linear-attention
